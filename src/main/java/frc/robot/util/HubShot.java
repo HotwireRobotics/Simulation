@@ -11,15 +11,13 @@ import java.util.function.DoubleUnaryOperator;
 /**
  * Aim and flywheel speed for shooting while the chassis is moving.
  *
- * <p>A stopped robot gets the distance regression unchanged. A moving robot uses the fixed-hood
- * virtual-target method: project the release point forward by the shot latency, estimate flight
- * time from hood pitch and exit speed, then move the hub opposite the chassis velocity for that
- * flight and iterate until the two agree. RPM is the regression at the distance to that virtual
- * hub, so forward and backward speed follow the real distance curve. {@link Solution#aim} is the
- * ball's direction toward that moving point. The chassis heading command does not use it. The hub
- * on the field is fixed, and {@link #chassisHeading} aims the back of the robot at that pose from
- * odometry alone. Every returned number is finite, and the heading offset and RPM scale are
- * clamped.
+ * <p>A stopped robot gets the distance regression unchanged. A moving robot solves the fixed-hood
+ * trajectory: {@code tan(pitch) * |Δ - v t| = ½ g t² + (hub height - muzzle height)}. The aim is
+ * the direction of {@code Δ/t - v}, the horizontal velocity the muzzle must add to the chassis.
+ * Flywheel RPM is the regression times that exit speed over the stopped shot's exit speed, so a
+ * stopped robot stays on the regression. That ratio is fixed by the equation. There is no hang-time
+ * gain, RPM scale, or lead-angle cap. The only ceiling is the flywheel's max RPM. The hub pose
+ * itself does not move. The chassis faces the opposite way from {@link Solution#aim}.
  */
 public final class HubShot {
 
@@ -41,16 +39,19 @@ public final class HubShot {
     /** Distance from the release point to the real hub, meters. */
     public final double distanceMeters;
 
-    /** Distance from the release point to the virtual hub, meters. This selects RPM. */
+    /**
+     * Ground range the ball flies relative to the moving muzzle, {@code |Δ - v t|}, meters. Equal to
+     * {@link #distanceMeters} when the chassis is stopped.
+     */
     public final double effectiveDistanceMeters;
 
     public final double rpm;
     public final double stationaryRpm;
 
-    /** Flight time used for the virtual hub, seconds. */
+    /** Flight time of the solved lob, seconds. Zero when no real root exists. */
     public final double flightSeconds;
 
-    /** Heading offset from the raw hub bearing, radians, after clamping. */
+    /** Heading offset from the raw hub bearing, radians. The projectile equation sets this. */
     public final double leadRadians;
 
     /** Chassis speed to the left of the hub ray, m/s. */
@@ -64,13 +65,13 @@ public final class HubShot {
 
     /**
      * @param pose release translation
-     * @param aim field direction of the shot toward the virtual hub, not the chassis heading
+     * @param aim field direction of the ball, not the chassis heading
      * @param distanceMeters distance to the real hub
-     * @param effectiveDistanceMeters distance used for the regression
+     * @param effectiveDistanceMeters ground range {@code |Δ - v t|}
      * @param rpm flywheel setpoint
      * @param stationaryRpm regression RPM at the real hub distance
-     * @param flightSeconds flight time of the converged shot
-     * @param leadRadians clamped offset from the raw bearing
+     * @param flightSeconds flight time of the solved lob
+     * @param leadRadians offset from the raw bearing
      * @param perpMetersPerSecond sideways speed, positive to the left of the ray
      * @param radialMetersPerSecond speed toward the hub
      * @param live true when this was solved from finite inputs
@@ -198,20 +199,15 @@ public final class HubShot {
 
     public double shooterLeftMeters = Constants.Shooter.kShooterLeftMeters;
     public double lookaheadSeconds = Constants.Shooter.kShotLookaheadSeconds;
-    public double metersPerSecondPerRpm = Constants.Shooter.kHorizontalMetersPerSecondPerRPM;
     public double hoodPitchRadians = Math.toRadians(Constants.Shooter.kHoodPitchDegrees);
-    public double leadGainRadiansPerMps = 0.0;
-    public double minScale = 0.70;
-    public double maxScale = 1.40;
-    public double maxLeadRadians = Math.toRadians(25.0);
+    public double launchHeightMeters = Constants.Shooter.kShooterHeightMeters;
+    public double hubEntryHeightMeters = Constants.Shooter.kHubEntryHeightMeters;
+    public double gravityMetersPerSecondSquared = Constants.Shooter.kGravityMetersPerSecondSquared;
+
+    /** Sensor sanity limit on chassis speed, m/s. Not an aim or RPM gain. */
     public double maxFieldSpeed = 5.5;
-    public double minExitMetersPerSecond = 4.0;
-    public double minDistanceMeters = 0.30;
-    public double maxDistanceMeters = 8.0;
+
     public double maxRpm = 5500.0;
-    public double minFlightSeconds = 0.12;
-    public double maxFlightSeconds = 1.10;
-    public int iterations = 6;
     public double regressionBase = Constants.base;
     public double regressionExp = Constants.exponential;
 
@@ -344,9 +340,8 @@ public final class HubShot {
     if (!isFinite(geometric)) {
       return fallback();
     }
-    double minDistance = positive(in.minDistanceMeters, 0.30);
-    double maxDistance = Math.max(minDistance, positive(in.maxDistanceMeters, 8.0));
-    double distance = MathUtil.clamp(Math.max(geometric, 0.0), minDistance, maxDistance);
+    // Real geometry. A made-up minimum distance would move both the regression and the lob.
+    double distance = Math.max(geometric, 0.0);
     Rotation2d bearing = geometric > 1e-4 ? toHubNow.getAngle() : Rotation2d.kZero;
     Translation2d ray =
         geometric > 1e-4 ? toHubNow.div(geometric) : new Translation2d(1.0, 0.0);
@@ -354,65 +349,6 @@ public final class HubShot {
       ray = new Translation2d(1.0, 0.0);
       bearing = Rotation2d.kZero;
     }
-
-    int steps = (int) MathUtil.clamp(in.iterations, 1, 8);
-    Translation2d virtual = in.hub;
-    double flight = positive(in.minFlightSeconds, 0.12);
-    double shiftCap = maxSpeed * positive(in.maxFlightSeconds, 1.10);
-    for (int i = 0; i < steps; i++) {
-      double virtualDistance = virtual.minus(release).getNorm();
-      if (!isFinite(virtualDistance)) {
-        virtual = in.hub;
-        break;
-      }
-      virtualDistance = MathUtil.clamp(Math.max(virtualDistance, 0.0), minDistance, maxDistance);
-      flight = flightSeconds(in, virtualDistance);
-      Translation2d shift = clampVector(vRelease.times(flight), shiftCap);
-      Translation2d next = in.hub.minus(shift);
-      if (!isFinite(next)) {
-        break;
-      }
-      // Half-step a large jump so a noisy speed cannot oscillate the virtual hub.
-      if (i > 0) {
-        Translation2d step = next.minus(virtual);
-        double stepNorm = step.getNorm();
-        if (Double.isFinite(stepNorm) && stepNorm > 0.75) {
-          next = virtual.plus(step.times(0.5));
-        }
-      }
-      virtual = next;
-    }
-
-    Translation2d toVirtual = virtual.minus(release);
-    if (!isFinite(toVirtual)) {
-      toVirtual = toHubNow;
-      virtual = in.hub;
-    }
-    double effective = toVirtual.getNorm();
-    if (!isFinite(effective)) {
-      effective = distance;
-    }
-    effective = MathUtil.clamp(Math.max(effective, 0.0), minDistance, maxDistance);
-    flight = flightSeconds(in, effective);
-
-    double maxRpm = positive(in.maxRpm, 5500.0);
-    double stationaryRpm = MathUtil.clamp(stationaryRpm(in, distance), 0.0, maxRpm);
-    double movingRpm = MathUtil.clamp(stationaryRpm(in, effective), 0.0, maxRpm);
-    double scale = stationaryRpm > 1.0 ? movingRpm / stationaryRpm : 1.0;
-    if (!isFinite(scale)) {
-      scale = 1.0;
-    }
-    double minScale = finiteOr(in.minScale, 0.70);
-    double maxScale = finiteOr(in.maxScale, 1.40);
-    if (maxScale < minScale) {
-      maxScale = minScale;
-    }
-    scale = MathUtil.clamp(scale, minScale, maxScale);
-    double rpm = stationaryRpm * scale;
-    if (!isFinite(rpm)) {
-      rpm = FALLBACK_RPM;
-    }
-    rpm = MathUtil.clamp(rpm, 0.0, maxRpm);
 
     double vLeft = ray.getX() * vRelease.getY() - ray.getY() * vRelease.getX();
     double vRadial = vRelease.getX() * ray.getX() + vRelease.getY() * ray.getY();
@@ -423,34 +359,65 @@ public final class HubShot {
       vRadial = 0.0;
     }
 
-    Rotation2d aim = toVirtual.getNorm() > 1e-4 ? toVirtual.getAngle() : bearing;
-    double gain = MathUtil.clamp(finiteOrZero(in.leadGainRadiansPerMps), -0.20, 0.20);
-    aim = aim.plus(Rotation2d.fromRadians(-gain * vLeft));
-    if (!isFinite(aim.getRadians())) {
-      aim = bearing;
-    }
-    double maxLead = positive(in.maxLeadRadians, Math.toRadians(25.0));
-    double delta = Math.IEEEremainder(aim.minus(bearing).getRadians(), Math.PI * 2.0);
-    if (!isFinite(delta)) {
-      delta = 0.0;
-      aim = bearing;
-    } else if (Math.abs(delta) > maxLead) {
-      delta = Math.copySign(maxLead, delta);
-      aim = bearing.plus(Rotation2d.fromRadians(delta));
+    double maxRpm = positive(in.maxRpm, Constants.Shooter.kMaxRpm);
+    double stationary = MathUtil.clamp(stationaryRpm(in, distance), 0.0, maxRpm);
+    double pitch = finiteOr(in.hoodPitchRadians, Math.toRadians(Constants.Shooter.kHoodPitchDegrees));
+    // Numerical guard so tan and cos stay finite. The hood itself is a fixed 70°.
+    pitch = MathUtil.clamp(pitch, 0.05, Math.PI / 2.0 - 0.05);
+    double gravity =
+        positive(in.gravityMetersPerSecondSquared, Constants.Shooter.kGravityMetersPerSecondSquared);
+    double launchZ = finiteOr(in.launchHeightMeters, Constants.Shooter.kShooterHeightMeters);
+    double entryZ = finiteOr(in.hubEntryHeightMeters, Constants.Shooter.kHubEntryHeightMeters);
+    double dz = entryZ - launchZ;
+
+    Arc arc = null;
+    if (geometric > 1e-4 && isFinite(dz)) {
+      arc = solveArc(toHubNow, vRelease, pitch, gravity, dz);
     }
 
+    Rotation2d aim = bearing;
+    double rpm = stationary;
+    double flight = 0.0;
+    double effective = distance;
+    double lead = 0.0;
+    if (arc != null && isFinite(arc.exitMetersPerSecond) && isFinite(arc.aim.getRadians())) {
+      // Stopped exit speed from the same equation. The ratio is 1 when v is 0, so the regression
+      // is not replaced. It is not a tuned gain: s and s0 are fixed by pitch, gravity, and height.
+      Double stoppedExit = stoppedExitSpeed(distance, pitch, gravity, dz);
+      boolean stopped = vRelease.getNorm() <= 1e-8;
+      if (!stopped && stoppedExit != null && stoppedExit > 1e-6) {
+        double scaled = stationary * (arc.exitMetersPerSecond / stoppedExit);
+        if (isFinite(scaled)) {
+          rpm = scaled;
+        }
+      } else if (!stopped && isFinite(arc.groundRangeMeters)) {
+        // Too close for a stopped lob. The moving root is the same vacuum shot as a stopped
+        // robot at the ground range the ball actually flies, so use that regression entry.
+        double ranged = stationaryRpm(in, arc.groundRangeMeters);
+        if (isFinite(ranged)) {
+          rpm = ranged;
+        }
+      }
+      if (!stopped) {
+        aim = arc.aim;
+        lead = Math.IEEEremainder(aim.minus(bearing).getRadians(), Math.PI * 2.0);
+        if (!isFinite(lead)) {
+          lead = 0.0;
+          aim = bearing;
+        }
+      }
+      flight = arc.timeSeconds;
+      if (isFinite(arc.groundRangeMeters)) {
+        effective = arc.groundRangeMeters;
+      }
+    }
+    if (!isFinite(rpm)) {
+      rpm = FALLBACK_RPM;
+    }
+    rpm = MathUtil.clamp(rpm, 0.0, maxRpm);
+
     return new Solution(
-        release,
-        aim,
-        distance,
-        effective,
-        rpm,
-        stationaryRpm,
-        flight,
-        delta,
-        vLeft,
-        vRadial,
-        true);
+        release, aim, distance, effective, rpm, stationary, flight, lead, vLeft, vRadial, true);
   }
 
   /**
@@ -486,33 +453,209 @@ public final class HubShot {
   }
 
   /**
-   * Time for a fixed-hood shot to cover {@code meters}. Horizontal speed is the exit speed times
-   * cos(pitch). The result is clamped so a flat or vertical hood cannot explode the virtual hub.
+   * One root of {@code tan(pitch) * |Δ - v t| = ½ g t² + Δz}. {@code aim} is the direction of
+   * {@code Δ/t - v}. {@code exitMetersPerSecond} is that vector's magnitude divided by {@code
+   * cos(pitch)}.
    */
-  private static double flightSeconds(Input in, double meters) {
-    double rpm = Math.max(stationaryRpm(in, meters), 0.0);
-    double perRpm =
-        MathUtil.clamp(
-            finiteOr(in.metersPerSecondPerRpm, Constants.Shooter.kHorizontalMetersPerSecondPerRPM),
-            0.001,
-            0.02);
-    double exit = rpm * perRpm;
-    double minExit = positive(in.minExitMetersPerSecond, 4.0);
-    if (!isFinite(exit) || exit < minExit) {
-      exit = minExit;
+  private static final class Arc {
+    final double timeSeconds;
+    final Rotation2d aim;
+    final double exitMetersPerSecond;
+    final double groundRangeMeters;
+
+    Arc(
+        double timeSeconds,
+        Rotation2d aim,
+        double exitMetersPerSecond,
+        double groundRangeMeters) {
+      this.timeSeconds = timeSeconds;
+      this.aim = aim;
+      this.exitMetersPerSecond = exitMetersPerSecond;
+      this.groundRangeMeters = groundRangeMeters;
     }
-    double pitch = finiteOr(in.hoodPitchRadians, Math.toRadians(Constants.Shooter.kHoodPitchDegrees));
-    pitch = MathUtil.clamp(pitch, Math.toRadians(20.0), Math.toRadians(75.0));
-    double horizontal = exit * Math.cos(pitch);
-    if (!isFinite(horizontal) || horizontal < 2.0) {
-      horizontal = 2.0;
+  }
+
+  /**
+   * Descending fixed-hood solution. A stopped chassis uses the closed form. A moving chassis
+   * brackets {@link #residual} and keeps the root nearest the stopped flight time, which is the
+   * lob that continues from the stationary shot. Returns null when a 70° ball cannot come down
+   * through the hub mouth.
+   */
+  private static Arc solveArc(
+      Translation2d delta, Translation2d velocity, double pitch, double gravity, double dz) {
+    double cos = Math.cos(pitch);
+    double tan = Math.tan(pitch);
+    if (!(cos > 1e-4) || !isFinite(tan) || !isFinite(delta) || !isFinite(velocity) || !(gravity > 0.0)) {
+      return null;
     }
-    double flight = meters / horizontal;
-    if (!isFinite(flight)) {
-      flight = positive(in.minFlightSeconds, 0.12);
+    double distance = delta.getNorm();
+    if (velocity.getNorm() <= 1e-8) {
+      Double flight = stoppedFlightSeconds(distance, pitch, gravity, dz);
+      if (flight == null) {
+        return null;
+      }
+      double exit = (distance / flight) / cos;
+      if (!isFinite(exit)) {
+        return null;
+      }
+      return new Arc(flight, delta.getAngle(), exit, distance);
     }
-    return MathUtil.clamp(
-        flight, positive(in.minFlightSeconds, 0.12), positive(in.maxFlightSeconds, 1.10));
+
+    double preferred = Double.NaN;
+    Double stopped = stoppedFlightSeconds(distance, pitch, gravity, dz);
+    if (stopped != null) {
+      preferred = stopped;
+    }
+    // Earliest a ball launched from below the mouth can be descending through it.
+    double tMin = dz > 0.0 ? Math.sqrt(2.0 * dz / gravity) : 1e-3;
+    if (!isFinite(tMin) || tMin < 1e-3) {
+      tMin = 1e-3;
+    }
+    // Past any 70° lob the chassis can still reach. After this, -½gt² keeps the residual negative.
+    double tMax = 8.0;
+    double step = 0.02;
+    Arc best = null;
+    double bestScore = Double.POSITIVE_INFINITY;
+    double tPrev = tMin;
+    double fPrev = residual(tPrev, delta, velocity, tan, gravity, dz);
+    for (double t = tMin + step; t <= tMax + 1e-9; t += step) {
+      double f = residual(t, delta, velocity, tan, gravity, dz);
+      Double root = crossing(tPrev, t, fPrev, f, delta, velocity, tan, gravity, dz);
+      if (root != null) {
+        Arc arc = arcAt(root, delta, velocity, cos);
+        if (arc != null) {
+          double score = isFinite(preferred) ? Math.abs(arc.timeSeconds - preferred) : -arc.timeSeconds;
+          if (best == null || score < bestScore) {
+            best = arc;
+            bestScore = score;
+          }
+        }
+      }
+      tPrev = t;
+      fPrev = f;
+    }
+    if (isFinite(fPrev) && fPrev == 0.0) {
+      Arc arc = arcAt(tPrev, delta, velocity, cos);
+      if (arc != null) {
+        double score = isFinite(preferred) ? Math.abs(arc.timeSeconds - preferred) : -arc.timeSeconds;
+        if (best == null || score < bestScore) {
+          best = arc;
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Flight time for a stopped shot that descends through {@code dz}. Null when the mouth is above
+   * the 70° launch ray or the ball would still be climbing at the hub.
+   */
+  private static Double stoppedFlightSeconds(
+      double distance, double pitch, double gravity, double dz) {
+    double tan = Math.tan(pitch);
+    if (!(distance > 1e-6) || !(tan > 0.0) || !(gravity > 0.0) || !isFinite(dz)) {
+      return null;
+    }
+    double reach = distance * tan - dz;
+    // Peak height is above the mouth only when reach > dz, i.e. distance * tan(pitch) > 2 dz.
+    if (!(reach > dz) || !isFinite(reach)) {
+      return null;
+    }
+    double t2 = 2.0 * reach / gravity;
+    if (!(t2 > 0.0) || !isFinite(t2)) {
+      return null;
+    }
+    return Math.sqrt(t2);
+  }
+
+  /**
+   * Exit speed along the hood for a stopped shot at {@code distance}. Same equation as {@link
+   * #solveArc} with v = 0.
+   */
+  private static Double stoppedExitSpeed(double distance, double pitch, double gravity, double dz) {
+    Double flight = stoppedFlightSeconds(distance, pitch, gravity, dz);
+    if (flight == null) {
+      return null;
+    }
+    double cos = Math.cos(pitch);
+    if (!(cos > 1e-4)) {
+      return null;
+    }
+    double exit = (distance / flight) / cos;
+    if (!isFinite(exit) || exit <= 0.0) {
+      return null;
+    }
+    return exit;
+  }
+
+  /** {@code tan(pitch) * |Δ - v t| - ½ g t² - Δz}. Zero at a hub-mouth crossing. */
+  private static double residual(
+      double t,
+      Translation2d delta,
+      Translation2d velocity,
+      double tan,
+      double gravity,
+      double dz) {
+    double range = delta.minus(velocity.times(t)).getNorm();
+    return tan * range - 0.5 * gravity * t * t - dz;
+  }
+
+  /** Time in {@code (t0, t1)} where {@link #residual} changes sign, or null. */
+  private static Double crossing(
+      double t0,
+      double t1,
+      double f0,
+      double f1,
+      Translation2d delta,
+      Translation2d velocity,
+      double tan,
+      double gravity,
+      double dz) {
+    if (isFinite(f0) && f0 == 0.0) {
+      return t0;
+    }
+    if (!isFinite(f0) || !isFinite(f1) || f0 * f1 >= 0.0) {
+      return null;
+    }
+    double lo = t0;
+    double hi = t1;
+    double flo = f0;
+    for (int i = 0; i < 50; i++) {
+      double mid = 0.5 * (lo + hi);
+      double fm = residual(mid, delta, velocity, tan, gravity, dz);
+      if (!isFinite(fm)) {
+        return null;
+      }
+      if (flo * fm <= 0.0) {
+        hi = mid;
+      } else {
+        lo = mid;
+        flo = fm;
+      }
+    }
+    double root = 0.5 * (lo + hi);
+    return isFinite(root) ? root : null;
+  }
+
+  /** Muzzle velocity and aim implied by a flight time that already satisfies the height equation. */
+  private static Arc arcAt(double t, Translation2d delta, Translation2d velocity, double cos) {
+    if (!(t > 1e-4) || !isFinite(t) || !(cos > 1e-4)) {
+      return null;
+    }
+    Translation2d added = delta.div(t).minus(velocity);
+    if (!isFinite(added)) {
+      return null;
+    }
+    double horizontal = added.getNorm();
+    if (!(horizontal > 1e-6)) {
+      return null;
+    }
+    double exit = horizontal / cos;
+    double ground = horizontal * t;
+    if (!isFinite(exit) || !isFinite(ground)) {
+      return null;
+    }
+    return new Arc(t, added.getAngle(), exit, ground);
   }
 
   /** Distance regression, using the caller's function when it returns a finite RPM. */

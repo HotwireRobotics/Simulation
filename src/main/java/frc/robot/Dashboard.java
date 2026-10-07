@@ -65,9 +65,6 @@ public class Dashboard {
   public static final Toggle alignmentRequirement =
       new Toggle("Dashboard/Alignment Requirement", true);
 
-  /** Extra aim trim on top of the velocity vector. See {@link Constants.Shooter#kLeadGain}. */
-  public static final Number leadGain = new Number("Shooter/Lead Gain", Constants.Shooter.kLeadGain);
-
   /** Pose projection time. See {@link Constants.Shooter#kShotLookaheadSeconds}. */
   public static final Number shotLookahead =
       new Number("Shooter/Shot Lookahead", Constants.Shooter.kShotLookaheadSeconds);
